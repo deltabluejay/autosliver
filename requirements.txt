@@ -1,4 +1,7 @@
+aiofiles==24.1.0
 inquirer==3.4.0
 prettytable==3.15.1
+prompt_toolkit==3.0.50
+PyYAML==6.0.2
 PyYAML==6.0.2
 termcolor==2.5.0

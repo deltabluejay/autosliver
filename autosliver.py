@@ -1,4 +1,4 @@
-import sliver, asyncio, inspect
+import sliver, asyncio, aiofiles, inspect
 import argparse, yaml, shlex
 import sys, os
 from datetime import datetime, timezone
@@ -83,7 +83,7 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
     def time_to_string(self, time):
         return datetime.fromtimestamp(time, tz=timezone.utc).strftime('%a, %d %b %Y %H:%M:%S UTC')
 
-    async def pretty_print_remotes(self, type):
+    def pretty_print_remotes(self, type):
         match type:
             case 'session':
                 implants = self.sessions
@@ -152,14 +152,15 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
     
     async def do_sessions(self, args):
         'List current sessions'
-        await self.pretty_print_remotes('session')
+        self.pretty_print_remotes('session')
 
     async def do_beacons(self, args):
         'List current beacons'
-        await self.pretty_print_remotes('beacon')
+        self.pretty_print_remotes('beacon')
     
     async def do_use(self, args):
         'Select targets'
+
         # TODO: add a default/"Select all" option
         implants = self.get_implants()
         if len(implants) == 0:
@@ -179,16 +180,22 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
         if len(implants) == 0:
             self.error('No targets selected')
             return
-
-        for implant in implants:
+        
+        async def process_interact(implant):
             if type(implant).__name__ == 'Beacon':
                 interaction = await self.client.interact_beacon(implant.ID)
             elif type(implant).__name__ == 'Session':
                 interaction = await self.client.interact_session(implant.ID)
             else:
                 self.error('Invalid implant type')
-                return
-            self.interactions.append(interaction)
+                return None
+            return interaction
+
+        tasks = [asyncio.create_task(process_interact(implant)) for implant in implants]
+        results = await asyncio.gather(*tasks)  # Run all tasks concurrently
+        # Filter out None values (invalid implants)
+        self.interactions.extend(filter(None, results))
+
         self.mode = self.INTERACT_MODE
 
     async def do_interactions(self, args):
@@ -198,13 +205,14 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
             self.error('Not in interactive mode')
             return
         
-        await self.pretty_print_remotes('interactive')
+        self.pretty_print_remotes('interactive')
     
     async def do_upload(self, args):
         'Upload a file to all target'
 
         if self.mode != self.INTERACT_MODE:
-            self.error
+            self.error(html_escape('Not in interactive mode'))
+            return
         if len(args) < 1:
             self.error(html_escape('Missing arguments <filename> <upload_path>'))
             return
@@ -217,12 +225,35 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
         self.info(f'Uploading {filename} to selected targets')
         with open(filename, 'rb') as f:
             data = f.read()
-        for interaction in self.interactions:
-            await interaction.upload(remote_path, data)
+        
+        async with asyncio.TaskGroup() as tg:
+            for interaction in self.interactions:
+                tg.create_task(interaction.upload(remote_path, data))
 
     async def do_download(self, args):
         'Download a file from all targets'
 
+        async def process_download(interaction, filename):
+            data = await interaction.download(filename)
+    
+            if data.Encoder == 'gzip':
+                gzip_data = data.Data
+                loop = asyncio.get_running_loop()
+                
+                # Decompress gzip data asynchronously
+                decompressed_data = await loop.run_in_executor(None, decompress_gzip, gzip_data)
+                
+                # Write the decompressed data asynchronously
+                output_filename = f'{interaction._session.RemoteAddress}-{os.path.basename(filename)}'
+                async with aiofiles.open(output_filename, 'wb') as f:
+                    await f.write(decompressed_data)
+            else:
+                print(f'Unsupported encoder: {data.Encoder}')
+
+        def decompress_gzip(gzip_data):
+            with gzip.GzipFile(fileobj=io.BytesIO(gzip_data), mode="rb") as f:
+                return f.read()
+    
         if self.mode != self.INTERACT_MODE:
             self.error('Not in interactive mode')
             return
@@ -232,17 +263,9 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
 
         filename = args[0]
         self.info(f'Downloading {filename} from selected targets')
-        for interaction in self.interactions:
-            data = await interaction.download(filename)
-            if data.Encoder == 'gzip':
-                gzip_data = data.Data
-                with gzip.GzipFile(fileobj=io.BytesIO(gzip_data), mode="rb") as f:
-                    decompressed_data = f.read()
-                with open(f'{interaction._session.RemoteAddress}-{os.path.basename(filename)}', 'wb') as f:
-                    f.write(decompressed_data)
-            else:
-                self.error(f'Unsupported encoder: {data.Encoder}')
-                return
+        
+        tasks = [asyncio.create_task(process_download(interaction, filename)) for interaction in self.interactions]
+        await asyncio.gather(*tasks)
 
     async def do_execute(self, args):
         'Execute a program on all targets'
@@ -257,12 +280,16 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
             self.error(html_escape('Missing argument(s) <command>'))
             return
         
-        self.info(f'Executing command on selected targets\n')
-        
-        for interaction in self.interactions:
+        async def process_execute(interaction, args):
             res = await interaction.execute(exe=args[0], args=args[1:], output=True)
             self.info(f'Output from {interaction._session.RemoteAddress}:')
             print(res.Stdout.decode())
+        
+        self.info(f'Executing command on selected targets\n')
+        
+        tasks = [asyncio.create_task(process_execute(interaction, args)) for interaction in self.interactions]
+        await asyncio.gather(*tasks)  # Run all tasks concurrently
+
     
     def do_clear(self, args):
         'Clear the screen'
@@ -301,28 +328,36 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
     
     async def loop(self):
         print(ANSI(colored(self.BANNER, "blue")))   # HTML() doesn't like the backslashes
+        update = asyncio.gather(self.client.sessions(), self.client.beacons())
+        self.sessions, self.beacons = await update
+
         cli = PromptSession(message=self.get_prompt, completer=self.CMD_COMPLETER, complete_style=CompleteStyle.READLINE_LIKE)
-        while True:
-            # Get command
-            cmd = await cli.prompt_async()
-            cmd = shlex.split(cmd)
-            print()
-            if len(cmd) == 0:
-                continue
-            if cmd[0] in self.get_cmds():
-                c = getattr(self, 'do_' + cmd[0])
-                # Run command
-                # try:
-                if inspect.iscoroutinefunction(c):
-                    await c(cmd[1:])
+        try:
+            while True:
+                # Get command
+                cmd = await cli.prompt_async()
+                cmd = shlex.split(cmd)
+                print()
+                if len(cmd) == 0:
+                    continue
+                if cmd[0] in self.get_cmds():
+                    c = getattr(self, 'do_' + cmd[0])
+                    # Run command
+                    try:
+                        if inspect.iscoroutinefunction(c):
+                            await c(cmd[1:])
+                        else:
+                            c(cmd[1:])
+                    except Exception as e:
+                        self.error(f'Error running command: {e}')
                 else:
-                    c(cmd[1:])
-                # except Exception as e:
-                    # self.error(f'Error: {e}')
-            else:
-                self.error(f'Unknown command: {cmd[0]}')
-    
+                    self.error(f'Unknown command: {cmd[0]}')
+        except KeyboardInterrupt:
+            self.info("Exiting...\n")
+            raise asyncio.CancelledError
+
     async def update(self):
+        await asyncio.sleep(5)
         while True:
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(self.update_implants())
